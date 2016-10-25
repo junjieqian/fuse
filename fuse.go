@@ -111,6 +111,7 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+	"log"
 )
 
 // A Conn represents a connection to a mounted FUSE file system.
@@ -203,7 +204,7 @@ var (
 )
 
 func initMount(c *Conn, conf *mountConfig) error {
-	req, err := c.ReadRequest()
+	req, err := c.ReadRequests()
 	if err != nil {
 		if err == io.EOF {
 			return ErrClosedWithoutInit
@@ -534,6 +535,7 @@ func (c *Conn) Close() error {
 
 // caller must hold wio or rio
 func (c *Conn) fd() int {
+	// log.Printf("---- [%d] Getting the fd()...", syscall.Getpid())
 	return int(c.dev.Fd())
 }
 
@@ -541,16 +543,21 @@ func (c *Conn) Protocol() Protocol {
 	return c.proto
 }
 
-// ReadRequest returns the next FUSE request from the kernel.
+// ReadRequests returns the next FUSE request from the kernel.
 //
 // Caller must call either Request.Respond or Request.RespondError in
 // a reasonable time. Caller must not retain Request after that call.
-func (c *Conn) ReadRequest() (Request, error) {
+func (c *Conn) ReadRequests() (Request, error) {
 	m := getMessage(c)
 loop:
 	c.rio.RLock()
+	log.Printf("%%%%%% [%d] In lock, before reading...", syscall.Getpid())
+	// time.Sleep(100 * time.Nanosecond)
 	n, err := syscall.Read(c.fd(), m.buf)
+	//n ,err := c.dev.Read(m.buf)
+	log.Printf("%%%%%% [%d] In lock, after reading...", syscall.Getpid())
 	c.rio.RUnlock()
+
 	if err == syscall.EINTR {
 		// OSXFUSE sends EINTR to userspace when a request interrupt
 		// completed before it got sent to userspace?
@@ -600,6 +607,7 @@ loop:
 		goto unrecognized
 
 	case opLookup:
+		log.Printf("Received Lookup op...")
 		buf := m.bytes()
 		n := len(buf)
 		if n == 0 || buf[n-1] != '\x00' {
@@ -621,6 +629,7 @@ loop:
 		}
 
 	case opGetattr:
+		log.Printf("Received Getattr op...")
 		switch {
 		case c.proto.LT(Protocol{7, 9}):
 			req = &GetattrRequest{
@@ -640,6 +649,7 @@ loop:
 		}
 
 	case opSetattr:
+		log.Printf("Received Setattr op...")
 		in := (*setattrIn)(m.data())
 		if m.len() < unsafe.Sizeof(*in) {
 			goto corrupt
@@ -815,6 +825,7 @@ loop:
 		req = r
 
 	case opWrite:
+		log.Printf("Received write op...")
 		in := (*writeIn)(m.data())
 		if m.len() < writeInSize(c.proto) {
 			goto corrupt
@@ -891,6 +902,7 @@ loop:
 			Xattr:    xattr,
 		}
 
+/*
 	case opGetxattr:
 		in := (*getxattrIn)(m.data())
 		if m.len() < unsafe.Sizeof(*in) {
@@ -907,6 +919,7 @@ loop:
 			Size:     in.Size,
 			Position: in.position(),
 		}
+*/
 
 	case opListxattr:
 		in := (*getxattrIn)(m.data())
@@ -931,6 +944,7 @@ loop:
 		}
 
 	case opFlush:
+		log.Printf("Received flush op...")
 		in := (*flushIn)(m.data())
 		if m.len() < unsafe.Sizeof(*in) {
 			goto corrupt
@@ -972,6 +986,7 @@ loop:
 		}
 
 	case opCreate:
+		log.Printf("Received create op...")
 		size := createInSize(c.proto)
 		if m.len() < size {
 			goto corrupt
@@ -1092,9 +1107,11 @@ func (c *Conn) writeToKernel(msg []byte) error {
 	out := (*outHeader)(unsafe.Pointer(&msg[0]))
 	out.Len = uint32(len(msg))
 
-	c.wio.RLock()
-	defer c.wio.RUnlock()
+	c.wio.Lock()
+	defer c.wio.Unlock()
+	// log.Printf("==== [%d] Starting to write to kernel", syscall.Getpid())
 	nn, err := syscall.Write(c.fd(), msg)
+	// log.Printf("==== [%d] Finished writing to kernel", syscall.Getpid())
 	if err == nil && nn != len(msg) {
 		Debug(bugShortKernelWrite{
 			Written: int64(nn),
@@ -1103,6 +1120,7 @@ func (c *Conn) writeToKernel(msg []byte) error {
 			Stack:   stack(),
 		})
 	}
+
 	return err
 }
 
@@ -1335,7 +1353,7 @@ func (a Attr) String() string {
 	return fmt.Sprintf("valid=%v ino=%v size=%d mode=%v", a.Valid, a.Inode, a.Size, a.Mode)
 }
 
-func unix(t time.Time) (sec uint64, nsec uint32) {
+func unix2(t time.Time) (sec uint64, nsec uint32) {
 	nano := t.UnixNano()
 	sec = uint64(nano / 1e9)
 	nsec = uint32(nano % 1e9)
@@ -1346,10 +1364,10 @@ func (a *Attr) attr(out *attr, proto Protocol) {
 	out.Ino = a.Inode
 	out.Size = a.Size
 	out.Blocks = a.Blocks
-	out.Atime, out.AtimeNsec = unix(a.Atime)
-	out.Mtime, out.MtimeNsec = unix(a.Mtime)
-	out.Ctime, out.CtimeNsec = unix(a.Ctime)
-	out.SetCrtime(unix(a.Crtime))
+	out.Atime, out.AtimeNsec = unix2(a.Atime)
+	out.Mtime, out.MtimeNsec = unix2(a.Mtime)
+	out.Ctime, out.CtimeNsec = unix2(a.Ctime)
+	out.SetCrtime(unix2(a.Crtime))
 	out.Mode = uint32(a.Mode) & 0777
 	switch {
 	default:
@@ -1670,6 +1688,7 @@ func (r *CreateRequest) String() string {
 
 // Respond replies to the request with the given response.
 func (r *CreateRequest) Respond(resp *CreateResponse) {
+	fmt.Sprintf("Respond start to Create a new file.")
 	eSize := entryOutSize(r.Header.Conn.proto)
 	buf := newBuffer(eSize + unsafe.Sizeof(openOut{}))
 
@@ -1687,6 +1706,7 @@ func (r *CreateRequest) Respond(resp *CreateResponse) {
 	o.OpenFlags = uint32(resp.Flags)
 
 	r.respond(buf)
+	fmt.Sprintf("Finished responding the create request")
 }
 
 // A CreateResponse is the response to a CreateRequest.

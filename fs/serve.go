@@ -411,7 +411,7 @@ func (s *Server) Serve(fs FS) error {
 	s.handle = append(s.handle, nil)
 
 	for {
-		req, err := s.conn.ReadRequest()
+		req, err := s.conn.ReadRequests()
 		if err != nil {
 			if err == io.EOF {
 				break
@@ -419,11 +419,11 @@ func (s *Server) Serve(fs FS) error {
 			return err
 		}
 
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
+		// s.wg.Add(1)
+		// go func() {
+		//	defer s.wg.Done()
 			s.serve(req)
-		}()
+		// }()
 	}
 	return nil
 }
