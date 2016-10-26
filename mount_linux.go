@@ -3,7 +3,6 @@ package fuse
 import (
 	"fmt"
 	"log"
-	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -55,6 +54,44 @@ func isBoringFusermountError(err error) bool {
 	return false
 }
 
+func mount(dir string, conf *mountConfig, ready chan<- struct{}, errp *error) error {
+	close(ready)
+
+	cmd := exec.Command(
+		"fusermount",
+		"-o", conf.getOptions(),
+		"--",
+		dir,
+	)
+	cmd.Env = append(os.Environ(), "_FUSE_COMMFD=3")
+	var wg sync.WaitGroup
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("setting up fusermount stderr: %v", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("setting up fusermount stderr: %v", err)
+	}
+	helperErrCh := make(chan error, 1)
+	wg.Add(2)
+	go lineLogger(&wg, "mount helper output", neverIgnoreLine, stdout)
+	go lineLogger(&wg, "mount helper error", handleFusermountStderr(helperErrCh), stderr)
+	wg.Wait()
+	if err := cmd.Wait(); err != nil {
+		select {
+		case helperErr := <-helperErrCh:
+			if !isBoringFusermountError(err) {
+				log.Printf("mount helper failed: %v", err)
+			}
+			return helperErr
+		default:
+		}
+	}
+	return err
+}
+
+/*
 func mount(dir string, conf *mountConfig, ready chan<- struct{}, errp *error) (fusefd *os.File, err error) {
 	// linux mount is never delayed
 	close(ready)
@@ -148,3 +185,4 @@ func mount(dir string, conf *mountConfig, ready chan<- struct{}, errp *error) (f
 	f := os.NewFile(uintptr(gotFds[0]), "/dev/fuse")
 	return f, nil
 }
+*/

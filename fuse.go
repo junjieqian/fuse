@@ -125,9 +125,15 @@ type Conn struct {
 
 	// File handle for kernel communication. Only safe to access if
 	// rio or wio is held.
+	/*
 	dev *os.File
 	wio sync.RWMutex
 	rio sync.RWMutex
+	*/
+
+	rio     sync.RWMutex
+	pReader *io.PipeReader
+	pWriter *io.PipeWriter
 
 	// Protocol version negotiated with InitRequest/InitResponse.
 	proto Protocol
@@ -169,11 +175,11 @@ func Mount(dir string, options ...MountOption) (*Conn, error) {
 	c := &Conn{
 		Ready: ready,
 	}
-	f, err := mount(dir, &conf, ready, &c.MountError)
+	err := mount(dir, &conf, ready, &c.MountError)
 	if err != nil {
 		return nil, err
 	}
-	c.dev = f
+	c.pReader, c.pWriter = io.Pipe()
 
 	if err := initMount(c, &conf); err != nil {
 		c.Close()
@@ -413,7 +419,7 @@ var bufSize = maxRequestSize + maxWrite
 //
 // Lifetime of a logical message is from getMessage to putMessage.
 // getMessage is called by ReadRequest. putMessage is called by
-// Conn.ReadRequest, Request.Respond, or Request.RespondError.
+// Conn.ReadRequests, Request.Respond, or Request.RespondError.
 //
 // Messages in the pool are guaranteed to have conn and off zeroed,
 // buf allocated and len==bufSize, and hdr set.
@@ -526,17 +532,17 @@ func (malformedMessage) String() string {
 
 // Close closes the FUSE connection.
 func (c *Conn) Close() error {
-	c.wio.Lock()
-	defer c.wio.Unlock()
 	c.rio.Lock()
 	defer c.rio.Unlock()
-	return c.dev.Close()
-}
-
-// caller must hold wio or rio
-func (c *Conn) fd() int {
-	// log.Printf("---- [%d] Getting the fd()...", syscall.Getpid())
-	return int(c.dev.Fd())
+	rerr := c.pReader.Close()
+	werr := c.pWriter.Close()
+	if rerr != nil {
+		return rerr
+	}
+	if werr != nil {
+		return werr
+	}
+	return nil
 }
 
 func (c *Conn) Protocol() Protocol {
@@ -553,8 +559,7 @@ loop:
 	c.rio.RLock()
 	log.Printf("%%%%%% [%d] In lock, before reading...", syscall.Getpid())
 	// time.Sleep(100 * time.Nanosecond)
-	n, err := syscall.Read(c.fd(), m.buf)
-	//n ,err := c.dev.Read(m.buf)
+	n, err := c.pReader.Read(m.buf)
 	log.Printf("%%%%%% [%d] In lock, after reading...", syscall.Getpid())
 	c.rio.RUnlock()
 
@@ -1107,10 +1112,8 @@ func (c *Conn) writeToKernel(msg []byte) error {
 	out := (*outHeader)(unsafe.Pointer(&msg[0]))
 	out.Len = uint32(len(msg))
 
-	c.wio.Lock()
-	defer c.wio.Unlock()
 	// log.Printf("==== [%d] Starting to write to kernel", syscall.Getpid())
-	nn, err := syscall.Write(c.fd(), msg)
+	nn, err := c.pWriter.Write(msg)
 	// log.Printf("==== [%d] Finished writing to kernel", syscall.Getpid())
 	if err == nil && nn != len(msg) {
 		Debug(bugShortKernelWrite{
